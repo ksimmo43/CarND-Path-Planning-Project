@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -156,7 +157,6 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 	double y = seg_y + d*sin(perp_heading);
 
 	return {x,y};
-
 }
 
 int main() {
@@ -195,8 +195,14 @@ int main() {
   	map_waypoints_dx.push_back(d_x);
   	map_waypoints_dy.push_back(d_y);
   }
+  //start in Lane
+  int lane = 1;
+  // set target velocity
+  double trg_vel = 49.5;
+  // set reference velocity
+  double ref_vel = 0.0;
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&lane, &ref_vel,&trg_vel](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -209,12 +215,13 @@ int main() {
 
       if (s != "") {
         auto j = json::parse(s);
-        
+
         string event = j[0].get<string>();
-        
+
         if (event == "telemetry") {
+
           // j[1] is the data JSON object
-          
+
         	// Main car's localization Data
           	double car_x = j[1]["x"];
           	double car_y = j[1]["y"];
@@ -226,20 +233,250 @@ int main() {
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
           	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
+          	// Previous path's end s and d values
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
 
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	json msgJson;
+            int prev_size = previous_path_x.size();
+
+            if (prev_size > 2)
+            {
+              car_s = end_path_s;
+            }
+
+            //need to go through the sensor fusion list to see if a car is ahead of us
+            bool too_close = false;
+            bool change_lanes = false;
+            bool forward_clear = true;
+            bool left_clear = true;
+            bool right_clear = true;
+            double follow_car_s = car_s + 100;
+            double follow_car_speed = 49.5;
+
+            // step through each vehicle to determine if they are important
+            for (int i=0; i<sensor_fusion.size(); i++)
+            {
+              float d = sensor_fusion[i][6];
+              double vx = sensor_fusion[i][3];
+              double vy = sensor_fusion[i][4];
+              double check_speed = sqrt(vx*vx+vy*vy)*2.24;
+              double check_car_s = sensor_fusion[i][5];
+              int check_car_lane = -1;
+
+              check_car_s+=(double)prev_size*0.02*check_speed/2.24;
+
+              // determine lane of car
+              if (0 <= d && d < 4)
+                {check_car_lane = 0;}
+              else if (4 <= d && d < 8)
+                {check_car_lane = 1;}
+              else if (8 <= d && d < 12)
+                {check_car_lane = 2;}
+              else //car is not going our direction
+                {check_car_lane = check_car_lane;}
+
+              // Compare check car with eog car location and react accordingly
+              if (check_car_lane == lane)
+              {
+                // set follow vehicle speed to closest vehicle in lane
+                if ((check_car_s > car_s) && (check_car_s < follow_car_s))
+                {
+                  follow_car_speed = check_speed;
+                }
+                // vehicle in our lane, going slower than ref_vel, attempt to change lanes
+                if ((check_car_s > car_s) && ((check_car_s-car_s) < 30) && follow_car_speed < trg_vel)
+                {
+                  change_lanes = true;
+                  forward_clear = false;
+                }
+                // if we cannot change lanes, slow down before running into vehicle
+                if ((check_car_s > car_s) && ((check_car_s-car_s) < 10)) //&& follow_car_speed < ref_vel)
+                {
+                  too_close = true;
+                }
+              }
+              else if (check_car_lane - lane == 1)
+              {
+                if((check_car_s > car_s && (check_car_s - car_s < 30) && check_speed < follow_car_speed+5) || (check_car_s < car_s && (car_s - check_car_s < 15) && (check_speed > car_speed)) || (abs(car_s - check_car_s) < 8))
+                {
+                    right_clear = false;
+                }
+              }
+              else if (check_car_lane - lane == -1)
+              {
+                if((check_car_s > car_s && (check_car_s - car_s < 30) && check_speed < follow_car_speed+5) || (check_car_s < car_s && (car_s - check_car_s < 15) && (check_speed > car_speed)) || (abs(car_s - check_car_s) < 8))
+                {
+                    left_clear = false;
+                }
+              }
+            }
+
+            // change_lanes if requested and possible
+            if (change_lanes)
+            {
+              if(left_clear && lane != 0)
+              {
+                  lane = lane - 1;
+              }
+              else if(right_clear && lane != 2)
+              {
+                 lane = lane + 1;
+              }
+            }
+            // Originally planned to return to middle lane, but this was removed to eliminate change of mind events
+            // else
+            // {
+            //   // always get back to middle lane if not changing lanes for obstacle
+            //   if(lane < 1 && right_clear)
+            //   {
+            //     lane = lane + 1;
+            //   }
+            //   else if(lane > 1 && left_clear)
+            //   {
+            //     lane = lane -1;
+            //   }
+            // }
+
+            // Modify ref_vel to prevent running into following vehicle
+            if (too_close)
+            {
+              ref_vel -=0.224*2;
+            }
+            else if (not(forward_clear))
+            {
+              // start slowing down to prevent getting too closest
+              if (car_speed > follow_car_speed)
+              {
+                ref_vel -=0.224;
+              }
+              else if ((car_speed < follow_car_speed) && (follow_car_s - car_s > 15))
+              {
+                ref_vel +=0.224;
+              }
+            }
+            else
+            {
+              if (ref_vel < trg_vel)
+              {
+                ref_vel+=0.224;
+              }
+            }
+
+            // Create list of sparse waypoints
+            vector<double> ptsx;
+            vector<double> ptsy;
+
+            // reference x,y, yaw states
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+
+            // if previous path size is small, just use current vehicle position
+            if (prev_size < 2)
+            {
+              // Use two points that make the path tangent to the car
+              double prev_car_x = car_x - cos(car_yaw);
+              double prev_car_y = car_y - sin(car_yaw);
+
+              ptsx.push_back(prev_car_x);
+              ptsx.push_back(ref_x);
+
+              ptsy.push_back(prev_car_y);
+              ptsy.push_back(ref_y);
+            }
+            // Use previous path's end point as starting reference
+            else
+            {
+              ref_x = previous_path_x[prev_size - 1];
+              ref_y = previous_path_y[prev_size - 1];
+
+              double ref_x_prev = previous_path_x[prev_size - 2];
+              double ref_y_prev = previous_path_y[prev_size - 2];
+              ref_yaw = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
+
+              // Use last two points from previous path to start new points
+              ptsx.push_back(ref_x_prev);
+              ptsx.push_back(ref_x);
+
+              ptsy.push_back(ref_y_prev);
+              ptsy.push_back(ref_y);
+            }
+
+            //Add evenly spaced sparse waypoints ahead of starting reference in Frenet
+            vector<double> nextwp0 = getXY(car_s+30,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+            vector<double> nextwp1 = getXY(car_s+60,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+            vector<double> nextwp2 = getXY(car_s+90,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+
+            ptsx.push_back(nextwp0[0]);
+            ptsx.push_back(nextwp1[0]);
+            ptsx.push_back(nextwp2[0]);
+
+            ptsy.push_back(nextwp0[1]);
+            ptsy.push_back(nextwp1[1]);
+            ptsy.push_back(nextwp2[1]);
+
+            for(int i = 0; i < ptsx.size(); i++)
+            {
+                //Transform to vehicle coordinates
+                double shift_x = ptsx[i]-ref_x;
+                double shift_y = ptsy[i]-ref_y;
+
+                ptsx[i] = (shift_x*cos(0-ref_yaw)-shift_y*sin(0-ref_yaw));
+                ptsy[i] = (shift_x*sin(0-ref_yaw)+shift_y*cos(0-ref_yaw));
+            }
+
+            // Create spline
+            tk::spline s;
+
+            // set sparse waypoints to spline
+            s.set_points(ptsx,ptsy);
 
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+            // Start with previous path points from last path
+            for(int i = 0; i < previous_path_x.size(); i++)
+            {
+              next_x_vals.push_back(previous_path_x[i]);
+              next_y_vals.push_back(previous_path_y[i]);
+            }
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+            // break up spline points
+            double target_x = 30;
+            double target_y = s(target_x);
+            double target_dist = sqrt((target_x*target_x)+(target_y*target_y));
+
+            double x_add_on = 0;
+
+            // Complete path with points from spline
+            for (int i = 1; i <= 50-previous_path_x.size(); i++)
+            {
+              double N = (target_dist/(.02*ref_vel/2.24));
+              double x_point = x_add_on+target_x/N;
+              double y_point = s(x_point);
+
+              x_add_on = x_point;
+
+              double x_ref = x_point;
+              double y_ref = y_point;
+
+              // Rotate point back to map frame
+              x_point = (x_ref*cos(ref_yaw)-y_ref*sin(ref_yaw));
+              y_point = (x_ref*sin(ref_yaw)+y_ref*cos(ref_yaw));
+
+              x_point += ref_x;
+              y_point += ref_y;
+
+              next_x_vals.push_back(x_point);
+              next_y_vals.push_back(y_point);
+            }
+
+
+          	json msgJson;
+
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
@@ -247,7 +484,7 @@ int main() {
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+
         }
       } else {
         // Manual driving
